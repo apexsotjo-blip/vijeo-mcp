@@ -1,26 +1,31 @@
 # Vijeo MCP
 
 An MCP server that lets an AI assistant (Claude Code, Claude Desktop, any MCP client) work on
-**Vijeo Designer** HMI projects: find which variables the screens really use, find broken
-references, and produce clean, validated **import files** for Vijeo.
+**Vijeo Designer** HMI projects:
+- analyse which variables the screens really use
+- edit variables, folders and data types directly in the project
+- edit panels: objects, colours, texts, trends, whole panels
 
 Built and verified on Vijeo Designer 6.2 with a real site project (67 panels, about 2,900 objects).
 
 ## Safety model
 
-- A project backup (`.vdz`) is **only ever read**, and only in memory. The tool never writes a `.vdz`.
-- Every edit writes a **new** file (variables `.csv` or data types `.VJDDataTypes`). Inputs are never
-  overwritten, and an existing output is only replaced with `overwrite=True`.
-- Changes reach the project only when **you** import those files in Vijeo Designer, which
-  validates them. Keep your `.vdz` backup until the import and build are OK.
+- **The source `.vdz` is never modified.** Edits are made in memory and written to a **new** `.vdz`
+  under a **new** project name, which you import in Vijeo (File > Import).
+- **Other outputs:** the CSV / data-types tools write new files too. Inputs are never overwritten,
+  and an existing output is only replaced with `overwrite=True`.
+- **Offline check:** every saved project is checked without Vijeo or UI, for complete records,
+  consistent ids and a readable variable database.
+- **Vijeo check:** `validate=True` also lets Vijeo itself load and re-save a throw-away copy, and
+  compares the result. Keep your original `.vdz` until the imported project builds.
 
 ## What you give it
 
 | Input | How to get it in Vijeo Designer |
 |---|---|
-| Project backup `.vdz` | File > Backup project |
-| Variable export `.csv` | Variables node > Export |
-| Data types `.VJDDataTypes` (optional) | Variables node > User Data Types > Export |
+| Project backup `.vdz` | File > Backup project. This is all the tools need, including for variables and data types |
+| Variable export `.csv` (optional) | Variables node > Export (only for the CSV tools below) |
+| Data types `.VJDDataTypes` (optional) | Variables node > User Data Types > Export (only for the CSV tools) |
 
 ## Tools
 
@@ -67,6 +72,34 @@ than through the popup selector, can't be detected.
 **Connect variables to a PLC or RTU.** Use `set_external_addresses` with
 `{name: address}` and a scan group, then `validate_variables`, then import the CSV.
 
+## Variables, folders and data types in the project
+
+With a project open (`open_graphics`), variables are read and written **inside the `.vdz`**. No CSV
+or data-types import is needed; the new `.vdz` is imported as a whole.
+
+| Tool | What it does |
+|---|---|
+| `project_variables` | Every variable and structure element with its settings: type, source, scan group and address, description, initial value, alarm (group, severity, message), logging group, input range, data sharing |
+| `project_folders_and_groups` | Folders, alarm / logging / scan groups, and structure data types with their members |
+| `set_project_variable` | Changes settings of a variable or structure element |
+| `add_project_variable` | Adds BOOL / INT / UINT / DINT / UDINT / REAL / STRING variables; missing folders are created |
+| `add_project_structure` | Adds a structure instance cloned from an existing one, with element addresses |
+| `new_project_structure` | Adds a structure instance straight from its data type |
+| `delete_project_variable` | Deletes a variable; refused while panels are bound to it |
+| `add_project_folder`, `delete_project_folder` | Creates folders; deletes empty ones |
+| `edit_project_data_type` | Adds or removes members of a structure type (every instance follows), adds or deletes types |
+
+New variables can be bound on panels right away. For example, copy a lamp with
+`rebind={"old": "PUMPS.P5.Running"}`.
+
+**How it's verified:**
+- **Offline:** the reader was compared with Vijeo's own CSV export of the same project. Across
+  985 variables and elements, type, source, address, scan group, description, alarm (group,
+  message, severity), logging group, data sharing and min/max all agree.
+- **In Vijeo:** after edits, Vijeo loads the project and re-saves it. Every variable, element,
+  folder and data type read back from Vijeo's save equals ours. Vijeo empties a usage cache and
+  re-orders some editor state when it saves, so this comparison is by content.
+
 ## Graphics editing
 
 Vijeo Designer has no public format or working automation for screens, so the panel format was
@@ -81,9 +114,13 @@ reverse-engineered. These edits are supported and validated:
 | `rename_object` | Renames an object (names must be unique among siblings) |
 | `rebind_variable` | Points one object, or the whole panel, at a different variable, e.g. `GENERAL.EMFM.EMFM1FLOW` → `EMFM2FLOW` |
 | `delete_object` | Deletes an object or a whole group |
-| `copy_object` | Duplicates an object or group on the same panel or onto another one, optionally re-bound (Pump 1 → Pump 2); this is how new objects are added |
-| `copy_panel` | Duplicates a whole base panel as a new base panel |
-| `object_style`, `set_object_style` | Reads/sets colours (`#RRGGBB` or `none`) and line width |
+| `add_object` | Creates a new rectangle, ellipse, line, polygon or text (position/size or points, colours, text) |
+| `copy_object` | Duplicates an object or group on the same panel or onto another one, optionally re-bound (Pump 1 → Pump 2) |
+| `copy_object_from_project` | Copies an object of any type from **another** project (e.g. a library of standard parts); bindings are re-created by name |
+| `copy_panel` | Duplicates a whole base panel or popup |
+| `object_style`, `set_object_style` | Reads/sets colours (`#RRGGBB` or `none`) and line width of shapes and texts |
+| `object_state_colors`, `set_object_state_color` | Reads/sets the per-state colours of switches, lamps, data displays and bar graphs |
+| `object_expressions`, `set_object_constant` | Lists an object's expressions: bindings, visibility/colour animation conditions, limits. Changes constants such as limits, min/max and animation values |
 | `object_texts`, `set_object_text`, `set_object_font` | Reads/sets displayed texts (one per state for switches and lamps) and their font |
 | `save_edited_project` | Writes a **new** `.vdz` under a **new** project name; `validate=True` checks every edited panel in Vijeo itself |
 
@@ -95,11 +132,27 @@ which moves every element such as `.ActiveValue` or `.HH_Alarm` to the other dev
 | Type | Colours | Line width |
 |---|---|---|
 | Rectangle | fill, line, pattern (all may be `none`) | yes |
-| Ellipse, Polygon | fill, line, pattern | yes |
+| Ellipse, Polygon | fill, line (both may be `none`), pattern | yes |
 | Line, Polyline, Arc | line | yes |
 | Text | text, fill, border (fill and border may be `none`), pattern | – |
 
-Switches, lamps and data displays: their texts and fonts can be changed; their colours can't yet.
+**State colours** (`set_object_state_color`) keep one table per state:
+
+| Type | Colours | States |
+|---|---|---|
+| Lamp, Switch | text, text_3d, frame, fore (the lamp/button colour), back | `off` (state 0), `on`; multi-state lamps: by table |
+| Data display | text, text_3d, frame, background | `normal`; the other tables by index |
+| Bar graph | indicator, frame, plate, text, text_3d, scale, marker | `normal`; threshold ranges by table |
+
+Switches drawn with a 3D plate style take their face from the style image, so their `fore` colour
+isn't visible; their text colour is.
+
+**Animations and thresholds:** `object_expressions` lists what drives an object:
+- variable bindings
+- visibility and colour animation conditions (e.g. `VA_Internal.AIs.ForceEn != 0`)
+- constants such as display limits, min/max and animation state values
+
+Variables are re-pointed with `rebind_variable`, and constants changed with `set_object_constant`.
 
 ### Trend graphs
 
@@ -193,15 +246,31 @@ trip byte-identically, and the colour offsets were confirmed by how Vijeo draws 
   empty channel, enabling/disabling, colour, width, marks, ranges, decimals and divisions all passed
   the round trip and show up as expected in Vijeo's drawing. Out-of-range limits aren't drawn in the
   editor, so they are checked by the round trip only.
+- **New objects:** rectangles, ellipses, polygons, lines and texts, plus a lamp and a trend graph
+  copied from another project (still bound).
+- **State colours:** lamp off fore/text, switch text, data-display background and bar-graph indicator,
+  each confirmed by how Vijeo draws them.
+- **Transparency:** ellipse and polygon fill/line `none`. The flags were found by rendering candidates.
+- **Constants:** a data-display limit changed from 16000 to 55.5.
+- **Popup copy:** registration byte-identical; objects re-saved with the same content (Vijeo re-orders
+  some objects' internal colour maps outside their own popup).
+- **Variable database:** updated, added and deleted variables; new and deleted folders; structure
+  instances cloned and built from a type; members added to and removed from types; new types. After
+  Vijeo's own save, all 1,245–1,330 variables and elements, the folders and the data types read back
+  equal.
 
 ### Not supported yet
 
-- Brand-new object types that don't exist anywhere in the project: copy an existing one instead.
-- Colours of switches, lamps, data displays and bar graphs; animations; thresholds.
-- `none` (transparent) for ellipse and polygon colours: Vijeo keeps a second flag for it that
-  this project has no example of.
-- Copying popup panels; `copy_panel` handles base panels.
-- Importing the CSV / data-types files still happens in Vijeo (Variables > Import).
+- **Other new object types:** switches, lamps, displays, meters and so on come from copying (from
+  this or another project), not from scratch.
+- **Multi-state lamps:** colour tables are addressed by table index, not state number. Two-state
+  lamps and switches use `off` / `on`.
+- **Bar-graph thresholds:** colours are editable, but the threshold *values* aren't mapped yet.
+- **Adding animations** to an object that has none; existing ones can be re-pointed and their
+  constants changed.
+- **Images** of another project aren't copied (`copy_object_from_project` refuses objects with images).
+- **Renaming** variables or structure members that panels use (bindings would have to be rewritten
+  everywhere).
 
 ## Install
 
@@ -254,6 +323,8 @@ These open Vijeo (a window appears; a few minutes in total):
 .\.venv\Scripts\python.exe tests\graphics_objects_e2e.py  # delete, copy, cross-panel copy
 .\.venv\Scripts\python.exe tests\appearance_e2e.py        # colours, texts, fonts, resize, popup, panel copy
 .\.venv\Scripts\python.exe tests\trends_e2e.py            # trend channels and graph settings
+.\.venv\Scripts\python.exe tests\project_db_e2e.py        # variables, folders, data types in the .vdz
+.\.venv\Scripts\python.exe tests\objects_colors_e2e.py    # new objects, library copy, popup copy, state colours
 ```
 
 ## About Vijeo's COM automation

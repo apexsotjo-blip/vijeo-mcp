@@ -65,6 +65,8 @@ EF = b"\xEF\xEF\xEF\xEF"
 VIJEO = r"C:\Program Files (x86)\Schneider Electric\Vijeo-Designer 6.2\Vijeo-Frame\Vijeo-Frame.exe"
 WORKSPACE = r"C:\Users\Public\Documents\Vijeo-Designer 6.2\Vijeo-Manager"
 LANG = "Targets/Target 1/Component 1/LangManager/LangManagerData"
+TAGDB = "Services/TagDatabase"
+NAMESERVER = "Services/NameServer"
 
 
 # ============================================================ object tree
@@ -177,10 +179,12 @@ def _points(b, o) -> list[int]:
 # Appearance, relative to the shape-properties marker (checked by rendering in Vijeo, see README):
 # colour = R, G, B, flag (flag 08 = "None"); some "None" states also set a companion byte.
 _RECT = {"fill": (0x08, 0x34), "line": (0x0C, 0x38), "pattern": (0x10, 0x30)}
-_SHAPE = {"fill": (0x08, None), "line": (0x0C, None), "pattern": (0x10, None)}
+# ellipse / polygon "none" companions found by rendering candidates in Vijeo (u32 flags)
+_ELLIPSE = {"fill": (0x08, 0x2A), "line": (0x0C, 0x26), "pattern": (0x10, None)}
+_POLYGON = {"fill": (0x08, 0x2C), "line": (0x0C, 0x30), "pattern": (0x10, None)}
 _STROKE = {"line": (0x08, None)}
 STYLE = {  # kind: (block version, colours {name: (offset, companion)}, line-width double offset)
-    "Rectangle": (2, _RECT, 0x1A), "Ellipse": (2, _SHAPE, 0x1A), "Polygon": (3, _SHAPE, 0x1A),
+    "Rectangle": (2, _RECT, 0x1A), "Ellipse": (2, _ELLIPSE, 0x1A), "Polygon": (3, _POLYGON, 0x1A),
     "Line": (2, _STROKE, 0x14), "Polyline": (3, _STROKE, 0x14), "Arc": (3, _STROKE, 0x14),
     "Text": (11, {"text": (0x1A, None), "fill": (0x1E, None), "pattern": (0x22, None), "border": (0x3A, 0x3E)}, None),
 }
@@ -235,6 +239,14 @@ def _lp(t: str) -> bytes:
 
 
 def _lp_at(b, p):
+    """A string in either encoding Vijeo uses: u32 byte length (incl. NUL) + UTF-16, or MFC CString."""
+    if b[p:p + 3] == b"\xff\xfe\xff":
+        n, q = b[p + 3], p + 4
+        if n == 0xFF:
+            n, q = struct.unpack_from("<H", b, p + 4)[0], p + 6
+        if q + 2 * n > len(b):
+            raise ValueError("string not recognised")
+        return bytes(b[q:q + 2 * n]).decode("utf-16-le"), q + 2 * n
     n = struct.unpack_from("<I", b, p)[0]
     if n % 2 or n > 8000 or p + 4 + n > len(b):
         raise ValueError("trend layout not recognised")
@@ -254,6 +266,21 @@ def _expr_block(b, p):
     for _ in range(7):
         t, q = _lp_at(b, q); strs.append(t)
     return strs, flag, kind, q
+
+
+def _find_expr(b, start, end):
+    """Offsets of well-formed expression blocks in [start, end)."""
+    p = b.find(_EXPR, start, end)
+    while p != -1:
+        try:
+            _, _, _, e = _expr_block(b, p)
+            if e <= end:
+                yield p
+                p = b.find(_EXPR, e, end)
+                continue
+        except (ValueError, struct.error, UnicodeDecodeError):
+            pass
+        p = b.find(_EXPR, p + 4, end)
 
 
 def _channel_bytes(var: str, chain: str) -> bytes:
@@ -289,6 +316,51 @@ def _trend_layout(b, o) -> dict:
     return lay
 
 
+# ============================================================ state colour tables / expressions
+# Switches, lamps, data displays and bar graphs keep one colour table per state: entries
+# [u8 key][01][00 00][R G B flag]; the table is preceded by u32 tag | u32 property count.
+_CTAB = re.compile(rb"(?:[\x00-\x20]\x01\x00\x00...[\x00\x08]){2,}", re.S)
+# key -> colour name, from Vijeo's colour tabs and checked by rendering (see README)
+COLOR_KEYS = {
+    "Lamp": {0: "text", 1: "text_3d", 4: "frame", 8: "fore", 9: "back"},
+    "Switch": {0: "text", 1: "text_3d", 4: "frame", 8: "fore", 9: "back"},
+    "DataDisplay": {0: "text", 1: "text_3d", 4: "frame", 5: "background"},
+    "BarGraph": {0: "text", 1: "text_3d", 2: "indicator", 4: "frame", 5: "plate", 6: "scale", 7: "marker"},
+}
+# table tag -> state name where it is known (two-state lamps / switches: tag 10 is what the editor shows
+# for state 0 = Off; data displays and bar graphs: tag 1 = normal)
+STATE_TAGS = {"Lamp": {10: "off", 9: "on"}, "Switch": {10: "off", 9: "on"},
+              "DataDisplay": {1: "normal"}, "BarGraph": {1: "normal"}}
+
+
+def _color_tables(b, o) -> list[dict]:
+    own_end = o.children[0].start if o.children else o.start + o.length
+    out = []
+    for m in _CTAB.finditer(b, o.start, own_end):
+        n = (m.end() - m.start()) // 8
+        tag = None
+        for back in range(9, 26):
+            i = m.start() - back
+            t, cnt = struct.unpack_from("<II", b, i)
+            if t < 64 and n <= cnt <= n + 3:
+                tag = t
+                break
+        if tag is None:
+            continue
+        entries = {b[i]: i + 4 for i in range(m.start(), m.end(), 8)}
+        if len(entries) != n:
+            continue
+        out.append({"tag": tag, "entries": entries})
+    return out
+
+
+def _constant_text(v) -> tuple[str, str]:
+    """Display text and runtime literal of a numeric constant as Vijeo writes them ('10', '10f')."""
+    f = float(v)
+    txt = str(int(f)) if f == int(f) else repr(f)
+    return txt, txt + "f"
+
+
 _LABELS = re.compile(rb"\x00\x01\x00\x00\x00(?:\x01\x00\x00\x00)?([\x01-\x20])\x00(?=\x01)", re.S)
 
 
@@ -308,6 +380,16 @@ def _text_refs(b, o, lang) -> list[int]:
         if all(b[q - 1] == 1 and q + 4 <= own_end and struct.unpack_from("<I", b, q)[0] in lang for q in offs):
             out.extend(offs)
     return out
+
+
+def _find_image(b, o) -> bool:
+    return any(x.kind == "Image" for _, x in walk([o]))
+
+
+class _AnyLang:
+    """Accepts any text id (the built-in Text template carries an id from another project)."""
+    def __contains__(self, tid):
+        return True
 
 
 def _transform(b, o, f) -> None:
@@ -658,9 +740,120 @@ class GraphicsSession:
     @property
     def resolver(self):
         if self._resolver is None:
-            self._resolver = Resolver(self._ole.openstream("Services/NameServer").read(),
-                                      self._ole.openstream("Services/TagDatabase").read())
+            self._resolver = Resolver(self._read("Services/NameServer"), self._read("Services/TagDatabase"))
         return self._resolver
+
+    # ---------------------------------------------------------------- project variables (in the .vdz)
+    @property
+    def tagdb(self):
+        from .tagdb import TagDB
+        return TagDB(self._read(TAGDB), self._read(NAMESERVER), self.lang)
+
+    def _tagdb_commit(self, T):
+        tdb, ns = T.data()
+        self.edits[TAGDB], self.edits[NAMESERVER] = tdb, ns
+        self._lang_commit()
+        self._resolver = None
+
+    def _usage(self, oid) -> list[str]:
+        """Panels whose graphics are bound to variable id `oid`."""
+        keys = [f"{{T,2:1.{oid},".encode("utf-16-le"), f"{{T,3:1.{oid}.".encode("utf-16-le")]
+        out = []
+        for name, info in self.panels.items():
+            g = self._read(info["root"] + "/GraphicalObject")
+            if any(k in g for k in keys):
+                out.append(name)
+        return out
+
+    def project_variables(self, prefix: str = "", elements: bool = True) -> list[dict]:
+        return self.tagdb.variables(prefix, elements)
+
+    def set_project_variable(self, name: str, **settings) -> dict:
+        T = self.tagdb
+        r = T.update(name, **settings)
+        self._tagdb_commit(T)
+        self.log.append(f"variable {name}: {settings}")
+        return r
+
+    def add_project_variable(self, name: str, data_type: str, source: str = "Internal", **settings) -> dict:
+        T = self.tagdb
+        r = T.add_variable(name, data_type, source, **settings)
+        self._tagdb_commit(T)
+        self.log.append(f"variable {name} added ({data_type}, {source})")
+        return r
+
+    def add_project_structure(self, name: str, like: str, addresses: dict | None = None) -> dict:
+        T = self.tagdb
+        r = T.add_structure_instance(name, like, addresses)
+        self._tagdb_commit(T)
+        self.log.append(f"structure {name} added (like {like})")
+        return r
+
+    def delete_project_variable(self, name: str, force: bool = False) -> dict:
+        T = self.tagdb
+        if name not in T.vars:
+            raise KeyError(f"No top-level variable '{name}'")
+        used = self._usage(T.vars[name]["oid"])
+        if used and not force:
+            raise ValueError(f"'{name}' is used on panels {used}; re-bind or delete those objects first "
+                             "(or force=True)")
+        r = T.delete_variable(name)
+        self._tagdb_commit(T)
+        self.log.append(f"variable {name} deleted")
+        return {**r, "was_used_on": used}
+
+    def project_data_type_edit(self, op: str, type_name: str, member: str = "", member_type: str = "",
+                               members: list | None = None, force: bool = False) -> dict:
+        """Structure types in the project itself: op add_member / remove_member / add_type / delete_type."""
+        T = self.tagdb
+        if op == "add_member":
+            r = T.add_type_member(type_name, member, member_type)
+        elif op == "remove_member":
+            t = T._type_records().get(type_name)
+            if t is None:
+                raise KeyError(f"No structure type '{type_name}'")
+            m = next((x for x in t["members"] if x["name"] == member), None)
+            if m is None:
+                raise KeyError(f"{type_name} has no member '{member}'")
+            used = []
+            for inst in T._instances_of(t["key"]):
+                key = f"{{T,3:1.{T.vars[inst]['oid']}.{m['index']},".encode("utf-16-le")
+                used += [f"{inst} on {p}" for p, i in self.panels.items()
+                         if key in self._read(i["root"] + "/GraphicalObject")]
+            if used and not force:
+                raise ValueError(f"{type_name}.{member} is used by panels: {used[:8]} (re-bind first or force=True)")
+            r = T.remove_type_member(type_name, member)
+        elif op == "add_type":
+            r = T.add_type(type_name, members or [])
+        elif op == "delete_type":
+            r = T.delete_type(type_name)
+        else:
+            raise ValueError("op: add_member, remove_member, add_type, delete_type")
+        self._tagdb_commit(T)
+        self.log.append(f"data type {op} {type_name} {member}")
+        return r
+
+    def new_project_structure(self, name: str, type_name: str, source: str = "Internal", scan_group: str = "",
+                              addresses: dict | None = None) -> dict:
+        T = self.tagdb
+        r = T.new_structure_instance(name, type_name, source, scan_group, addresses)
+        self._tagdb_commit(T)
+        self.log.append(f"structure {name} ({type_name}) added")
+        return r
+
+    def add_project_folder(self, path: str) -> dict:
+        T = self.tagdb
+        r = T.add_folder(path)
+        self._tagdb_commit(T)
+        self.log.append(f"folder {path} added")
+        return r
+
+    def delete_project_folder(self, path: str) -> dict:
+        T = self.tagdb
+        r = T.delete_folder(path)
+        self._tagdb_commit(T)
+        self.log.append(f"folder {path} deleted")
+        return r
 
     def _panel(self, name):
         if name not in self.panels:
@@ -831,6 +1024,105 @@ class GraphicsSession:
         after = _read_style(b, o)
         self.log.append(f"{panel}: {obj_path} style {({k: v for k, v in after.items() if before.get(k) != v})}")
         return {"object": obj_path, "from": before, "to": after}
+
+    # ---------------------------------------------------------------- state colours / expressions
+    def object_colors(self, panel, obj_path) -> dict:
+        """Per-state colour tables of a switch, lamp, data display or bar graph."""
+        root, path, b, objs = self._begin(panel)
+        o = _find(objs, obj_path)
+        if o.kind not in COLOR_KEYS:
+            raise ValueError(f"{obj_path} is a {o.kind}; state colours exist on {sorted(COLOR_KEYS)} "
+                             "(shapes and texts: object_style)")
+        names, states = COLOR_KEYS[o.kind], STATE_TAGS.get(o.kind, {})
+        tables = []
+        for k, t in enumerate(_color_tables(b, o)):
+            tables.append({"table": k, "tag": t["tag"], "state": states.get(t["tag"], f"tag {t['tag']}"),
+                           "colors": {names.get(key, f"key {key}"): "#" + b[at:at + 3].hex().upper()
+                                      for key, at in sorted(t["entries"].items())}})
+        return {"object": obj_path, "type": o.kind, "tables": tables}
+
+    def set_object_color(self, panel, obj_path, color: str, value, state: str | None = None,
+                         table: int | None = None) -> dict:
+        """Set one colour (e.g. 'fore', 'text', 'background', 'indicator') of one state table: state
+        ('off' / 'on' / 'normal') or table index; with neither, every table that has that colour."""
+        root, path, b, objs = self._begin(panel)
+        o = _find(objs, obj_path)
+        if o.kind not in COLOR_KEYS:
+            raise ValueError(f"{obj_path} is a {o.kind}; use object_style for shapes and texts")
+        keys = {v: k for k, v in COLOR_KEYS[o.kind].items()}
+        if color not in keys:
+            raise KeyError(f"{o.kind} colours: {sorted(keys)}")
+        rgb = _color(value)
+        if rgb is None:
+            raise ValueError("state colours can't be 'none'")
+        tabs = _color_tables(b, o)
+        sel = list(range(len(tabs)))
+        if state is not None:
+            tag = {v: k for k, v in STATE_TAGS.get(o.kind, {}).items()}.get(state)
+            if tag is None:
+                raise KeyError(f"{o.kind} states: {sorted(STATE_TAGS.get(o.kind, {}).values())} (or use table=)")
+            sel = [k for k, t in enumerate(tabs) if t["tag"] == tag]
+        if table is not None:
+            sel = [table]
+        changed = 0
+        for k in sel:
+            at = tabs[k]["entries"].get(keys[color])
+            if at is not None:
+                b[at:at + 3] = bytes(rgb)
+                changed += 1
+        if not changed:
+            raise ValueError(f"no table with colour '{color}' matched")
+        self._commit(path, b)
+        self.log.append(f"{panel}: {obj_path} {color}={value} ({changed} table(s))")
+        return {"object": obj_path, "color": color, "value": "#%02X%02X%02X" % rgb, "tables_changed": changed}
+
+    def object_expressions(self, panel, obj_path) -> list[dict]:
+        """Every expression of an object: variable bindings, animation conditions (visibility, colour),
+        constant limits (min / max / thresholds). index is what set_object_constant takes."""
+        root, path, b, objs = self._begin(panel)
+        o = _find(objs, obj_path)
+        own_end = o.children[0].start if o.children else o.start + o.length
+        out = []
+        for k, p in enumerate(_find_expr(b, o.start, own_end)):
+            strs, flag, kind, end = _expr_block(b, p)
+            names = [".".join(x[2] for x in re.findall(r"\{([FT]),[23]:([\d.]+),([^{}]+)\}", c))
+                     for c in _CHAIN.findall(strs[0])]
+            is_const = not names and re.fullmatch(r"-?\d+(\.\d+)?", strs[0] or "") is not None
+            out.append({"index": k, "kind": "constant" if is_const else ("variable" if names else "expression"),
+                        "text": strs[0] if not names else None, "variables": names or None,
+                        "runtime": strs[1] or None})
+        return out
+
+    def set_object_constant(self, panel, obj_path, index: int, value: float) -> dict:
+        """Change a constant expression (a min / max / threshold / animation value) of an object."""
+        root, path, b, objs = self._begin(panel)
+        o = _find(objs, obj_path)
+        own_end = o.children[0].start if o.children else o.start + o.length
+        blocks = list(_find_expr(b, o.start, own_end))
+        if not 0 <= index < len(blocks):
+            raise IndexError(f"{obj_path} has {len(blocks)} expressions")
+        p = blocks[index]
+        strs, flag, kind, end = _expr_block(b, p)
+        if not re.fullmatch(r"-?\d+(\.\d+)?", strs[0] or ""):
+            raise ValueError(f"expression {index} is not a constant ({strs[0]!r}); re-point variables with "
+                             "rebind_variable")
+        txt, lit = _constant_text(value)
+        if not strs[1].endswith("f"):
+            lit = txt if float(value) == int(float(value)) else repr(float(value))
+        # rewrite the two leading strings in the encoding the block uses, keep the rest of the block
+        q = p + 4
+        mfc = b[q:q + 3] == b"\xff\xfe\xff"
+        old_end = q
+        for _ in range(2):
+            old_end = _lp_at(b, old_end)[1]
+        new = (_encode("mfc", txt) + _encode("mfc", lit)) if mfc else (_lp(txt) + _lp(lit))
+        b[q:old_end] = new
+        delta = len(new) - (old_end - q)
+        for a in _ancestors(objs, o.start):
+            struct.pack_into("<I", b, a.start, struct.unpack_from("<I", b, a.start)[0] + delta)
+        self._commit(path, b)
+        self.log.append(f"{panel}: {obj_path} constant {index}: {strs[0]} -> {txt}")
+        return {"object": obj_path, "index": index, "from": strs[0], "to": txt}
 
     # ---------------------------------------------------------------- trend graphs
     def _trend_obj(self, panel, obj_path):
@@ -1118,6 +1410,166 @@ class GraphicsSession:
         return {"copy": new_path, "panel": dest, "objects": sum(1 for _ in walk(sub)),
                 "offset": [dx, dy], "new_texts": new_texts, "rebind_strings_changed": rebound}
 
+    # ---------------------------------------------------------------- new objects
+    def add_object(self, panel, kind: str, x: int = 0, y: int = 0, width: int = 100, height: int = 40, name: str = "",
+                   points: list | None = None, text: str | None = None, **style) -> dict:
+        """Create a new drawing object (Rectangle, Ellipse, Line, Polygon, Text) from a built-in template:
+        position / size, or points [[x, y], ...] for lines and polygons; text for Text objects; colours and
+        line width as in set_style. Parts such as lamps, switches or displays: copy_object (also from
+        another project with copy_object_from_project)."""
+        import json as _json
+        tpl = _json.load(open(os.path.join(os.path.dirname(__file__), "templates.json"), encoding="utf-8"))
+        if kind not in tpl:
+            raise ValueError(f"add_object creates {sorted(tpl)}; copy other object types")
+        root, path, b, objs = self._begin(panel)
+        rec = bytearray.fromhex(tpl[kind])
+        # name + id
+        names = {o.name for o in objs}
+        base = name or kind
+        nm, k = base, 1
+        while nm in names:
+            if name:
+                raise ValueError(f"'{name}' already exists on {panel}")
+            k += 1
+            nm = f"{base}{k:02d}"
+        nl = struct.unpack_from("<I", rec, 49)[0]
+        new = nm.encode("utf-16-le") + b"\x00\x00"
+        rec[53:53 + nl] = new
+        struct.pack_into("<I", rec, 49, len(new))
+        struct.pack_into("<I", rec, 0, struct.unpack_from("<I", rec, 0)[0] + len(new) - nl)
+        struct.pack_into("<I", rec, 37, max([x.id for _, x in walk(objs)] + [0]) + 1)
+        wrapped = bytearray(b"\x00" + bytes(rec) + b"\x00" * 9)
+        o = _chain(bytes(wrapped), 1, len(wrapped) - 9)[0]
+        # explicit polygon points: rewrite the point list (u32 count + doubles)
+        if points and kind == "Polygon":
+            offs = _points(wrapped, o)
+            cnt_at = offs[0] - 4
+            pts = [(float(px), float(py)) for px, py in points]
+            if pts[0] != pts[-1]:
+                pts.append(pts[0])                               # Vijeo closes polygons
+            newpts = struct.pack("<I", len(pts)) + b"".join(struct.pack("<2d", *p) for p in pts)
+            old_end = offs[-1] + 16
+            wrapped[cnt_at:old_end] = newpts
+            struct.pack_into("<I", wrapped, 1, struct.unpack_from("<I", wrapped, 1)[0] + len(newpts) - (old_end - cnt_at))
+            xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+            struct.pack_into("<4h", wrapped, 1 + 41, int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys)))
+            o = _chain(bytes(wrapped), 1, len(wrapped) - 9)[0]
+        elif points and kind == "Line":
+            (x1, y1), (x2, y2) = points[:2]
+            offs = _points(wrapped, o)
+            struct.pack_into("<2d", wrapped, offs[0], float(x1), float(y1))
+            struct.pack_into("<2d", wrapped, offs[1], float(x2), float(y2))
+            struct.pack_into("<4h", wrapped, 1 + 41, min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
+        else:
+            l, t, r, bt = o.rect
+            sx = (width - 1) / (r - l) if r != l else 1.0
+            sy = (height - 1) / (bt - t) if bt != t else 1.0
+            _transform(wrapped, o, lambda px, py: (x + (px - l) * sx, y + (py - t) * sy))
+        # a Text object gets its own language-table entry (font copied from an existing text)
+        if kind == "Text":
+            q = _text_refs(wrapped, o, _AnyLang())[0]
+            some = next((t for t in self.lang.entries if self.lang.font(t)), None)
+            tid = self.lang.clone(some, text or nm)
+            struct.pack_into("<I", wrapped, q, tid)
+            self._lang_commit()
+        rec = bytes(wrapped[1:-9])
+        at = objs[-1].start + objs[-1].length if objs else 1
+        b[at:at] = rec
+        self._commit(path, b)
+        self.log.append(f"{panel}: added {kind} {nm}")
+        res = {"object": nm, "kind": kind, "rect": list(_find(parse_panel(self._read(path)), nm).rect)}
+        colors = {k: v for k, v in style.items() if k in ("fill", "line", "text_color", "border", "pattern") and v}
+        if "text_color" in colors:
+            colors["text"] = colors.pop("text_color")
+        if kind == "Text":                              # plain label by default: no frame, no background
+            colors.setdefault("border", "none")
+            colors.setdefault("fill", "none")
+        if colors or style.get("line_width") is not None:
+            res["style"] = self.set_style(panel, nm, line_width=style.get("line_width"), **colors)["to"]
+        return res
+
+    def copy_object_from_project(self, src_vdz: str, src_panel: str, obj_path: str, to_panel: str,
+                                 new_name: str = "", x: int | None = None, y: int | None = None,
+                                 rebind: dict | None = None) -> dict:
+        """Copy an object (any type, with its subtree) from ANOTHER project into this one. Variable
+        bindings are re-created by name in this project (rebind {source variable: target variable}
+        changes them on the way); texts are copied with their fonts. Objects using the source project's
+        images are refused (their bitmaps are not copied)."""
+        src = GraphicsSession(src_vdz)
+        sb = src._read(src._panel(src_panel) + "/GraphicalObject")
+        so = _find(parse_panel(sb), obj_path)
+        rec = bytearray(sb[so.start:so.start + so.length])
+        if b"BitmapManager" in rec or _find_image(sb, so):
+            raise ValueError(f"{obj_path} uses images of the source project; copy it in Vijeo instead")
+        root, path, b, objs = self._begin(to_panel)
+        before = _leaves(bytes(b))
+        wrapped = bytearray(b"\x00" + bytes(rec) + b"\x00" * 9)
+        sub = _chain(bytes(wrapped), 1, len(wrapped) - 9)
+        l, t = so.rect[0], so.rect[1]
+        dx, dy = (0 if x is None else x - l), (0 if y is None else y - t)
+        next_id = max([o.id for _, o in walk(objs)] + [0]) + 1
+        # texts: copy the source entries into this project's language table
+        for _, o in walk(sub):
+            struct.pack_into("<I", wrapped, o.start + 37, next_id); next_id += 1
+            _transform(wrapped, o, lambda px, py: (px + dx, py + dy))
+            for q in _text_refs(wrapped, o, src.lang):
+                sid = struct.unpack_from("<I", wrapped, q)[0]
+                s0, _, _, e0 = src.lang.entries[sid]
+                entry = bytearray(src.lang.b[s0:e0])
+                some = next(iter(self.lang.entries))
+                tid = self.lang.clone(some)
+                struct.pack_into("<I", entry, 0, tid)
+                a0, _, _, a1 = self.lang.entries[tid]
+                self.lang.b[a0:a1] = entry
+                self.lang._index()
+                struct.pack_into("<I", wrapped, q, tid)
+        self._lang_commit()
+        rec = bytearray(wrapped[1:-9])
+        # bindings: source ids -> this project's ids, by variable name
+        R_src, R = src.resolver, self.resolver
+        rebind = rebind or {}
+        missing = []
+
+        def remap(chain):
+            name = ".".join(re.findall(r",([^,{}]+)\}", chain))
+            target = rebind.get(name, name)
+            try:
+                return R.binding(target)
+            except KeyError:
+                missing.append(target)
+                return chain
+        wr = bytearray(b"\x00" + bytes(rec) + b"\x00" * 9)
+        tmp_objs = _chain(bytes(wr), 1, len(wr) - 9)
+        for st, en, text, kind in sorted(_strings(wr, 1, len(wr) - 9, "{"), reverse=True):
+            new_t = _CHAIN.sub(lambda m: remap(m.group()), text)
+            for old, new in rebind.items():
+                new_t = re.sub(r"TagDB\." + re.escape(old) + r"(?![A-Za-z0-9_])", "TagDB." + new, new_t)
+            if new_t != text:
+                _replace_span(wr, _chain(bytes(wr), 1, len(wr) - 9), st, en, _encode(kind, new_t))
+        if missing:
+            raise KeyError(f"variables not in this project: {sorted(set(missing))} (create them with "
+                           "add_project_variable, or pass rebind={...})")
+        rec = bytearray(wr[1:-9])
+        top = _chain(bytes(wr), 1, len(wr) - 9)[0]
+        names = {o.name for o in objs}
+        nm = new_name or top.name
+        k = 2
+        while nm in names:
+            if new_name:
+                raise ValueError(f"'{new_name}' already exists on {to_panel}")
+            nm = f"{top.name}_{k}"; k += 1
+        nl = struct.unpack_from("<I", rec, 49)[0]
+        newn = nm.encode("utf-16-le") + b"\x00\x00"
+        rec[53:53 + nl] = newn
+        struct.pack_into("<I", rec, 49, len(newn))
+        struct.pack_into("<I", rec, 0, struct.unpack_from("<I", rec, 0)[0] + len(newn) - nl)
+        at = objs[-1].start + objs[-1].length if objs else 1
+        b[at:at] = rec
+        self._commit(path, b)
+        self._sf_sync(root, self._read(path), before)
+        self.log.append(f"{to_panel}: copied {obj_path} from {os.path.basename(src_vdz)}/{src_panel} as {nm}")
+        return {"object": nm, "panel": to_panel, "objects": sum(1 for _ in walk(sub))}
+
     # ---------------------------------------------------------------- whole panels
     def copy_panel(self, panel: str, new_name: str) -> dict:
         """Duplicate a base panel (all its objects, bindings, dependency list) as a new base panel.
@@ -1127,8 +1579,6 @@ class GraphicsSession:
         info = self.panels.get(panel)
         if info is None:
             raise KeyError(f"No panel '{panel}'.")
-        if info["popup"]:
-            raise ValueError("copy_panel supports base panels (popups live in popup groups).")
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", new_name):
             raise ValueError("Panel names: letters, digits, underscore; must not start with a digit.")
         if new_name.lower() in {n.lower() for n in self.panels}:
@@ -1162,7 +1612,8 @@ class GraphicsSession:
         struct.pack_into("<H", ns, node_at + 8, struct.unpack_from("<H", ns, node_at + 8)[0] + 1)
         # --- WindowObject: name id, name, PanelID
         old_nl = struct.unpack_from("<I", wo, 8)[0]
-        pid = max([i["id"] or 0 for i in self.panels.values() if not i["popup"]] + [0]) + 1
+        same_kind = [i["id"] or 0 for i in self.panels.values() if i["popup"] == info["popup"]]
+        pid = max(same_kind + [0]) + 1                 # base panels 1.., popups 10000..
         wo[8:12 + old_nl + 4] = struct.pack("<I", len(nm)) + nm + struct.pack("<I", pid)
         struct.pack_into("<I", wo, 4, new_id)
         # --- copy every stream of the panel storage; the panel gets its own texts
@@ -1182,7 +1633,7 @@ class GraphicsSession:
                 copied.append(rel)
         self._lang_commit()
         self.edits[wep_p], self.edits[wl_p], self.edits[ns_p] = bytes(wep), bytes(wl), bytes(ns)
-        self.panels[new_name] = {"root": root, "id": pid, "popup": False}
+        self.panels[new_name] = {"root": root, "id": pid, "popup": info["popup"]}
         self.log.append(f"copied panel {panel} -> {new_name} ({store}, PanelID {pid})")
         return {"panel": new_name, "storage": store, "panel_id": pid, "name_id": new_id, "streams": copied}
 
@@ -1291,9 +1742,18 @@ def verify_project(vdz: str, original_vdz: str = "") -> dict:
             path = "/".join(p)
             if not ref._ole.exists(path) and not any(path.startswith(r + "/") for r in new_roots):
                 errors.append(f"unexpected new stream: {path}")
-        allowed = ("/GraphicalObject", "/StatusFlags", "BasePanelsList/WindowEditorProperties", LANG)
-        if new_roots:
-            allowed += ("BasePanelsList/WindowList", "Services/NameServer")
+        allowed = ("/GraphicalObject", "/StatusFlags", "BasePanelsList/WindowEditorProperties", LANG, TAGDB,
+                   NAMESERVER)
+        if new_roots:                                  # the list the new panel was registered in
+            allowed += tuple({r.rsplit("/", 1)[0] + "/WindowList" for r in new_roots}
+                             | {r.rsplit("/", 1)[0] + "/WindowEditorProperties" for r in new_roots})
+        if TAGDB in changed_streams or NAMESERVER in changed_streams:
+            try:
+                from .tagdb import TagDB
+                T = TagDB(s._read(TAGDB), s._read(NAMESERVER), s.lang)
+                notes.append(f"variable database: {len(T.vars)} variables, {len(T.folders)} folders")
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"variable database unreadable after edits: {e}")
         bad = [c for c in changed_streams if not c.endswith(allowed)]
         if bad:
             errors.append(f"streams changed that graphics edits never touch: {bad[:5]}")
@@ -1305,17 +1765,18 @@ def verify_project(vdz: str, original_vdz: str = "") -> dict:
                 last = struct.unpack_from("<I", ns, counter_at)[0]
             except Exception as e:  # noqa: BLE001
                 errors.append(f"NameServer unreadable ({e})"); ns_ids, last = set(), 0
-            wl = s._read("Targets/Target 1/Component 1/WindowList/BasePanelsList/WindowList")
-            pids = [i["id"] for i in s.panels.values() if not i["popup"]]
+            pids = [i["id"] for i in s.panels.values()]
             if len(pids) != len(set(pids)):
-                errors.append("two base panels share a PanelID")
+                errors.append("two panels share a PanelID")
             for r in new_roots:
+                lst = r.rsplit("/", 1)[0]
+                wl = s._read(lst + "/WindowList")
                 wo = s._read(r + "/WindowObject")
                 nsid = struct.unpack_from("<I", wo, 4)[0]
                 if nsid not in ns_ids or nsid > last:
                     errors.append(f"{r}: panel name id {nsid} is not registered in the NameServer")
                 if r.rsplit("/", 1)[1].encode("utf-16-le") + b"\x00\x00" not in wl:
-                    errors.append(f"{r}: storage not listed in BasePanelsList/WindowList")
+                    errors.append(f"{r}: storage not listed in {lst.rsplit('/', 1)[1]}/WindowList")
     try:
         lang = s.lang
     except ValueError as e:
@@ -1383,6 +1844,17 @@ def verify_project(vdz: str, original_vdz: str = "") -> dict:
 
 
 # ============================================================ validation through Vijeo itself
+def _object_structure(g: bytes) -> list:
+    """What a panel shows, independent of Vijeo's serialisation order: every object's path, type,
+    rectangle and variable bindings."""
+    out = []
+    for path, o in walk(parse_panel(g)):
+        own_end = o.children[0].start if o.children else o.start + o.length
+        txt = " ".join(m.group().decode("utf-16-le") for m in _U16.finditer(g, o.start, own_end))
+        out.append((path, o.kind, tuple(o.rect), tuple(sorted(set(_CHAIN.findall(txt))))))
+    return out
+
+
 def validate_session(s: "GraphicsSession", panels: list[str] | None = None, screenshot_dir: str = "",
                      timeout_s: int = 120) -> dict:
     """Validate the session's edits through Vijeo, one throw-away import per edited panel.
@@ -1393,7 +1865,7 @@ def validate_session(s: "GraphicsSession", panels: list[str] | None = None, scre
     edited = [n for n, i in s.panels.items() if i["root"] + "/GraphicalObject" in s.edits]
     host = min((n for n, i in s.panels.items() if not i["popup"]),
                key=lambda n: len(s._read(s.panels[n]["root"] + "/GraphicalObject")))
-    panels = panels or edited or ([host] if LANG in s.edits else [])
+    panels = panels or edited or ([host] if (LANG in s.edits or TAGDB in s.edits) else [])
     if not panels:
         raise RuntimeError("No edits to validate.")
     results, saved_edits = {}, s.edits
@@ -1406,7 +1878,7 @@ def validate_session(s: "GraphicsSession", panels: list[str] | None = None, scre
             h = s.panels[host]["root"]
             for leaf in ("GraphicalObject", "StatusFlags", "PropertyAlias"):
                 src = info["root"] + "/" + leaf
-                if s._ole.exists(src) and s._ole.exists(h + "/" + leaf):
+                if s._exists(src) and s._exists(h + "/" + leaf):
                     test_edits[h + "/" + leaf] = s._read(src)
                     if leaf != "PropertyAlias":
                         expected[h + "/" + leaf] = s._read(src)
@@ -1415,12 +1887,15 @@ def validate_session(s: "GraphicsSession", panels: list[str] | None = None, scre
                 p = info["root"] + "/" + leaf
                 if p in saved_edits:
                     expected[p] = saved_edits[p]
-            if not s._ole.exists(info["root"] + "/WindowObject"):       # copied panel: its registration too
-                lst = info["root"].rsplit("/", 1)[0]
-                for p in (info["root"] + "/WindowObject", lst + "/WindowList", "Services/NameServer"):
-                    expected[p] = saved_edits[p]
+        if not s._ole.exists(info["root"] + "/WindowObject"):           # copied panel: its registration too
+            lst = info["root"].rsplit("/", 1)[0]
+            for p in (info["root"] + "/WindowObject", lst + "/WindowList", "Services/NameServer"):
+                expected[p] = saved_edits[p]
         if LANG in saved_edits:
             expected[LANG] = saved_edits[LANG]
+        for p in (TAGDB, NAMESERVER):
+            if p in saved_edits:
+                expected[p] = saved_edits[p]
         tmpd = tempfile.mkdtemp(prefix="vijeo_mcp_val_")
         name = f"VJMCP-CHECK-{os.getpid()}-{int(time.time())}-{k}"
         try:
@@ -1429,9 +1904,25 @@ def validate_session(s: "GraphicsSession", panels: list[str] | None = None, scre
         finally:
             s.edits = saved_edits
         shot = os.path.join(screenshot_dir, f"check_{panel}.png") if screenshot_dir else ""
-        r = validate_in_vijeo(os.path.join(tmpd, name + ".vdz"), check_panel, expected, timeout_s, shot)
+        dump = os.path.join(tmpd, "vijeo")
+        r = validate_in_vijeo(os.path.join(tmpd, name + ".vdz"), check_panel, expected, timeout_s, shot, dump)
         r["method"] = (f"popup: objects loaded in base panel '{host}' of the test project (Vijeo does not open "
                        "popups on load)" if info["popup"] else "base panel opened and re-saved by Vijeo")
+        if info["popup"] and r.get("saved_by_vijeo"):
+            # outside its own popup Vijeo re-orders some objects' internal property maps; then compare what
+            # the panel shows: every object's path, type, rectangle and variable bindings
+            h = s.panels[host]["root"]
+            for leaf in ("GraphicalObject", "StatusFlags"):
+                p = f"{h}/{leaf}"
+                if r["round_trip_identical"].get(p) is False:
+                    f = os.path.join(dump, p.replace("/", "__") + ".vijeo")
+                    if leaf == "GraphicalObject":
+                        same = _object_structure(open(f, "rb").read()) == _object_structure(expected[p])
+                    else:
+                        same = sorted(_sf_vars(open(f, "rb").read())[1]) == sorted(_sf_vars(expected[p])[1])
+                    r["round_trip_identical"][p] = "same objects (Vijeo re-ordered property maps)" if same else False
+            if all(v is not False for v in r["round_trip_identical"].values()):
+                r["verdict"] = "PASS - Vijeo loaded the popup's objects and re-saved them with the same content"
         shutil.rmtree(tmpd, ignore_errors=True)
         results[panel] = r
     ok = all(r["verdict"].startswith("PASS") for r in results.values())
@@ -1508,8 +1999,8 @@ def validate_in_vijeo(vdz: str, check_panel: str, expected: dict[str, bytes], ti
                     tx = texts(h)
                     if any("will only be imported" in x for x in tx):
                         user32.PostMessageW(h, 0x0111, 1, 0)
-                    elif tx and (title, tx[0]) not in events:
-                        events.append((title, tx[0]))
+                    elif tx and (title, " | ".join(tx)) not in events:
+                        events.append((title, " | ".join(tx)))
                 if cls == "AfxMDIFrame80u":
                     result_extra["vijeo_title"] = title
                     if check_panel in title:
@@ -1560,8 +2051,28 @@ def validate_in_vijeo(vdz: str, check_panel: str, expected: dict[str, bytes], ti
     if saved:
         o = olefile.OleFileIO(os.path.join(proj_dir, name + ".SwxCF"))
         # the language table is a hash map: Vijeo re-saves it in its own entry order -> compare with that
+        raw_expected = dict(expected)
         expected = {p: (LangTable(d).vijeo_resave() if p == LANG else d) for p, d in expected.items()}
         result["round_trip_identical"] = {p: o.openstream(p).read() == data for p, data in expected.items()}
+        # variables: Vijeo empties its usage cache and re-orders editor state when it saves the variable
+        # database, so compare by meaning - every variable, element, setting and folder must read back equal
+        if TAGDB in expected and not result["round_trip_identical"][TAGDB]:
+            from .tagdb import TagDB
+            def listing(tdb, ns, lang):
+                T = TagDB(tdb, ns, LangTable(lang))
+                return T.variables(), T.folder_list(), T.data_types()
+            src = olefile.OleFileIO(io.BytesIO(zipfile.ZipFile(vdz).read(name + ".SwxCF")))
+            ours = listing(raw_expected[TAGDB], raw_expected.get(NAMESERVER) or src.openstream(NAMESERVER).read(),
+                           raw_expected.get(LANG) or src.openstream(LANG).read())
+            theirs = listing(o.openstream(TAGDB).read(), o.openstream(NAMESERVER).read(), o.openstream(LANG).read())
+            same = ours == theirs
+            result["round_trip_identical"][TAGDB] = same
+            result["variables_compared"] = {"variables": len(ours[0]), "folders": len(ours[1]), "equal": same}
+            if not same:
+                diff = [(a, b) for a, b in zip(ours[0], theirs[0]) if a != b][:3]
+                result["variables_diff"] = diff or {"ours": len(ours[0]), "vijeo": len(theirs[0])}
+        if NAMESERVER in expected and not result["round_trip_identical"][NAMESERVER] and TAGDB in expected:
+            result["round_trip_identical"][NAMESERVER] = result["round_trip_identical"][TAGDB]
         if dump_dir:                                  # keep Vijeo's version of any stream that differs
             os.makedirs(dump_dir, exist_ok=True)
             for p, same in result["round_trip_identical"].items():

@@ -62,7 +62,7 @@ b = s._read(s.panels["Home"]["root"] + "/GraphicalObject")
 rule = gfx._find(gfx.parse_panel(b), "Rule")
 x1, y1, x2, y2 = [round(v) for p in gfx._points(b, rule) for v in __import__("struct").unpack_from("<2d", b, p)]
 check("line points follow copy + resize", (x1 <= 41 and abs(x2 - x1) >= 590 and y1 in (160, 161)), f"{x1},{y1}-{x2},{y2}")
-for bad in (lambda: s.set_style("Home", "Dot", fill="none"), lambda: s.set_style("Home", "Rule", fill="#FF0000")):
+for bad in (lambda: s.set_style("Home", "Dot", pattern="none"), lambda: s.set_style("Home", "Rule", fill="#FF0000")):
     try:
         bad(); check("rejects unsupported style", False)
     except (ValueError, KeyError):

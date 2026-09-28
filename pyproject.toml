@@ -1,7 +1,7 @@
 [project]
 name = "vijeo-mcp"
-version = "0.1.0"
-description = "MCP server for Vijeo Designer HMI projects: read-only backup analysis and validated import-file generation"
+version = "0.2.0"
+description = "MCP server for Vijeo Designer HMI projects: analyse and edit variables, data types, panels and trends directly in the project, verified offline and by Vijeo itself"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -21,3 +21,6 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+vijeo_mcp = ["templates.json"]

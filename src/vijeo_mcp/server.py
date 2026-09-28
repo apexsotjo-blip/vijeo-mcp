@@ -380,7 +380,13 @@ def set_object_font(panel: str, object_path: str, face: str | None = None, heigh
 
 def _logging_note(variable: str) -> str | None:
     """Trend channels plot only variables that belong to a data logging group."""
-    if not variable or S.table is None:
+    if not variable:
+        return None
+    if S.table is None:                              # read the project itself
+        row = next((r for r in _g().project_variables(variable, True) if r["name"] == variable), None)
+        if row is not None and not row.get("logging_group"):
+            return (f"'{variable}' has no data logging group: the trend will stay empty until it gets one "
+                    "(set_project_variable logging_group=...).")
         return None
     v = S.table.vars.get(variable)
     if v is None:
@@ -428,10 +434,168 @@ def set_trend_channel(panel: str, object_path: str, channel: int, variable: str 
 
 @mcp.tool()
 def copy_panel(panel: str, new_name: str) -> dict:
-    """Duplicate a BASE panel as a new base panel (all objects, variable bindings, dependency list and
-    its own copies of every text), registered like Vijeo does (storage, panel list, new PanelID,
-    name id). Then edit it like any panel, e.g. rebind_variable to point the copy at other equipment."""
+    """Duplicate a base panel or a popup (a popup stays in its popup group): all objects, variable
+    bindings, dependency list and its own copies of every text, registered like Vijeo does (storage,
+    panel list, new PanelID, name id). Then edit it like any panel, e.g. rebind_variable to point the
+    copy at other equipment."""
     return _g().copy_panel(panel, new_name)
+
+
+@mcp.tool()
+def add_object(panel: str, kind: str, x: int = 0, y: int = 0, width: int = 100, height: int = 40, name: str = "",
+               points: list[list[float]] | None = None, text: str | None = None, fill: str | None = None,
+               line: str | None = None, text_color: str | None = None, border: str | None = None,
+               line_width: float | None = None) -> dict:
+    """Create a NEW drawing object on a panel: kind Rectangle, Ellipse, Line, Polygon or Text. Rectangles,
+    ellipses and texts use x, y, width, height; lines and polygons use points [[x, y], ...]. Colours
+    '#RRGGBB' (or 'none' where supported), line_width; text for Text objects (plain label: no frame, no
+    background unless given). For switches, lamps, displays, graphs etc. use copy_object, or
+    copy_object_from_project to take them from a library project."""
+    return _g().add_object(panel, kind, x, y, width, height, name, points, text, fill=fill, line=line,
+                           text_color=text_color, border=border, line_width=line_width)
+
+
+@mcp.tool()
+def copy_object_from_project(src_vdz: str, src_panel: str, object_path: str, to_panel: str, new_name: str = "",
+                             x: int | None = None, y: int | None = None,
+                             rebind: dict[str, str] | None = None) -> dict:
+    """Copy an object of ANY type (lamp, switch, display, trend, group, ...) from another project's .vdz -
+    e.g. a library project of standard parts - into the open project. Variable bindings are re-created
+    by name here (rebind {source variable: variable here} re-points them); texts come with their fonts.
+    Objects that use the source project's images are refused."""
+    return _g().copy_object_from_project(src_vdz, src_panel, object_path, to_panel, new_name, x, y, rebind)
+
+
+@mcp.tool()
+def object_state_colors(panel: str, object_path: str) -> dict:
+    """Per-state colours of a switch, lamp, data display or bar graph: one table per state ('off' / 'on'
+    for two-state switches and lamps, 'normal' for data displays and bar graphs, other tables by tag),
+    with text / text_3d / frame / fore / back / background / indicator / plate / scale / marker colours."""
+    return _g().object_colors(panel, object_path)
+
+
+@mcp.tool()
+def set_object_state_color(panel: str, object_path: str, color: str, value: str, state: str | None = None,
+                           table: int | None = None) -> dict:
+    """Set one state colour, e.g. a lamp's 'fore' (lamp colour) for state 'on' to '#FF0000', a switch's
+    'text' for 'off', a data display's 'background' for 'normal', a bar graph's 'indicator'. Without
+    state/table every state table that has that colour is changed."""
+    return _g().set_object_color(panel, object_path, color, value, state, table)
+
+
+@mcp.tool()
+def object_expressions(panel: str, object_path: str) -> list[dict]:
+    """All expressions of an object: variable bindings, animation conditions (visibility, colour) and
+    constants such as data-display / bar-graph limits and animation state values. Re-point variables with
+    rebind_variable; change constants with set_object_constant."""
+    return _g().object_expressions(panel, object_path)
+
+
+@mcp.tool()
+def set_object_constant(panel: str, object_path: str, index: int, value: float) -> dict:
+    """Change a constant expression of an object (index from object_expressions): a limit, min / max,
+    threshold or animation state value."""
+    return _g().set_object_constant(panel, object_path, index, value)
+
+
+# ------------------------------------------------ project variables, directly in the .vdz (no CSV import)
+def _settings(**kw) -> dict:
+    return {k: v for k, v in kw.items() if v is not None}
+
+
+@mcp.tool()
+def project_variables(prefix: str = "", elements: bool = True) -> list[dict]:
+    """Variables of the open project (open_graphics), read from the .vdz itself: name, kind (Variable /
+    Structure / Element), type, source (Internal / External / InternalReference), description, initial
+    value, scan group and address, alarm (group, severity, message), logging group, input range, data
+    sharing, string length. prefix filters by name ('VA_External.VSDs.')."""
+    return _g().project_variables(prefix, elements)
+
+
+@mcp.tool()
+def project_folders_and_groups() -> dict:
+    """Variable folders, alarm / logging / scan groups and structure data types of the open project."""
+    T = _g().tagdb
+    return {"folders": T.folder_list(), "groups": {k: sorted(v.values()) for k, v in T.groups().items()},
+            "data_types": {n: [f"{m}: {t}" for m, t in mem] for n, mem in T.data_types().items()}}
+
+
+@mcp.tool()
+def set_project_variable(name: str, description: str | None = None, initial_value: str | float | None = None,
+                         source: str | None = None, scan_group: str | None = None, address: str | None = None,
+                         alarm: dict | bool | None = None, logging_group: str | None = None,
+                         input_range: list[float] | None = None, sharing: str | None = None,
+                         string_bytes: int | None = None) -> dict:
+    """Change settings of a variable or structure element directly in the project (no CSV import).
+    source 'Internal' / 'External' (External needs scan_group + address); alarm: false to disable, or
+    {"group": "AlarmGroup1", "severity": 1, "message": "..."}; logging_group '' removes it; input_range
+    [min, max] or []; sharing 'None' / 'Read Only'. Structure elements take address, alarm, logging,
+    description, initial value; their source / scan group come from the structure instance."""
+    s = _settings(description=description, initial_value=initial_value, source=source, scan_group=scan_group,
+                  address=address, alarm=alarm, logging_group=logging_group, input_range=input_range,
+                  sharing=sharing, string_bytes=string_bytes)
+    return _g().set_project_variable(name, **s)
+
+
+@mcp.tool()
+def add_project_variable(name: str, data_type: str, source: str = "Internal", description: str | None = None,
+                         initial_value: str | float | None = None, scan_group: str | None = None,
+                         address: str | None = None, alarm: dict | bool | None = None,
+                         logging_group: str | None = None, input_range: list[float] | None = None,
+                         sharing: str | None = None, string_bytes: int | None = None) -> dict:
+    """Add a variable (BOOL, INT, UINT, DINT, UDINT, REAL, STRING) directly to the project; missing folders
+    in the name ('PUMPS.P5.Running') are created. Same settings as set_project_variable. The variable can
+    be bound on panels right away (rebind_variable / copy_object rebind)."""
+    s = _settings(description=description, initial_value=initial_value, scan_group=scan_group, address=address,
+                  alarm=alarm, logging_group=logging_group, input_range=input_range, sharing=sharing,
+                  string_bytes=string_bytes)
+    return _g().add_project_variable(name, data_type, source, **s)
+
+
+@mcp.tool()
+def add_project_structure(name: str, like: str, addresses: dict[str, str] | None = None) -> dict:
+    """Add a structure instance (e.g. a new VSD) by cloning an existing instance `like` - same type and
+    element settings - with addresses {member: address} for its elements, e.g.
+    add_project_structure("VA_External.VSDs.P3T1", like="VA_External.VSDs.P1T1",
+                          addresses={"Running": "%MW3001", "Speed": "%MW3002"})."""
+    return _g().add_project_structure(name, like, addresses)
+
+
+@mcp.tool()
+def edit_project_data_type(op: str, type_name: str, member: str = "", member_type: str = "",
+                           members: list[list[str]] | None = None, force: bool = False) -> dict:
+    """Edit structure data types directly in the project (no .VJDDataTypes import):
+    op 'add_member' (member, member_type: BOOL/INT/UINT/DINT/UDINT/REAL/STRING - every instance gets the
+    element; set addresses with set_project_variable 'Instance.Member'), 'remove_member' (refused while
+    panels use it unless force), 'add_type' (members [[name, type], ...]), 'delete_type' (no instances)."""
+    return _g().project_data_type_edit(op, type_name, member, member_type, members, force)
+
+
+@mcp.tool()
+def new_project_structure(name: str, type_name: str, source: str = "Internal", scan_group: str = "",
+                          addresses: dict[str, str] | None = None) -> dict:
+    """Create a structure instance from its data type (no existing instance needed), e.g.
+    new_project_structure("PUMPS.P5", "PUMP", "External", "EquipoModbus01", {"Running": "%M5001"})."""
+    return _g().new_project_structure(name, type_name, source, scan_group, addresses)
+
+
+@mcp.tool()
+def delete_project_variable(name: str, force: bool = False) -> dict:
+    """Delete a variable or structure instance from the project. Refused while panels are bound to it
+    (the result names them) unless force=True."""
+    return _g().delete_project_variable(name, force)
+
+
+@mcp.tool()
+def add_project_folder(path: str) -> dict:
+    """Create a variable folder (and missing parents), e.g. 'PUMPS.P5'."""
+    return _g().add_project_folder(path)
+
+
+@mcp.tool()
+def delete_project_folder(path: str) -> dict:
+    """Delete an empty variable folder."""
+    return _g().delete_project_folder(path)
 
 
 @mcp.tool()
