@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.egg-info/
+*.pyc
+
+# project data never goes into the repository
+demo/
+tests/paths_local.json
+*.vdz
+*.SwxCF
+*.VJDDataTypes
+*.csv
+*.CSV
+*.xls
+*.xlsx
+*.stu
+*.png
